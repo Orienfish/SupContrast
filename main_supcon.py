@@ -181,8 +181,9 @@ def set_model(opt):
     model = SupConResNet(name=opt.model)
     criterion = SupConLoss(temperature=opt.temp)
 
-    ckpt = torch.load(opt.ckpt, map_location='cpu')
-    state_dict = ckpt['model']
+    if len(opt.ckpt) > 0:
+        ckpt = torch.load(opt.ckpt, map_location='cpu')
+        state_dict = ckpt['model']
 
     # enable synchronized Batch Normalization
     if opt.syncBN:
@@ -203,7 +204,8 @@ def set_model(opt):
         criterion = criterion.cuda()
         cudnn.benchmark = True
 
-        model.load_state_dict(state_dict)
+        if len(opt.ckpt) > 0:
+            model.load_state_dict(state_dict)
 
     return model, criterion
 
