@@ -15,8 +15,6 @@ from util import adjust_learning_rate, warmup_learning_rate, accuracy
 from util import set_optimizer
 from networks.resnet_big import SupConResNet, LinearClassifier
 
-from sklearn.manifold import TSNE
-import matplotlib.pyplot as plt
 
 try:
     import apex
@@ -34,6 +32,10 @@ def plot_tsne(x, y_pred, y_true=None, title='', fig_name=''):
         title: str, title for the plots
         fig_name: str, the file name to save the plot
     """
+    from sklearn.manifold import TSNE
+    import matplotlib.pyplot as plt
+    import seaborn as sns
+
     tsne = TSNE(2, perplexity=50)
     x_emb = tsne.fit_transform(x)
 
@@ -48,18 +50,40 @@ def plot_tsne(x, y_pred, y_true=None, title='', fig_name=''):
         sns.scatterplot(x=x_emb[:, 0], y=x_emb[:, 1], hue=y_true,
                         palette=sns.color_palette("hls", np.unique(y_true).size),
                         legend="full", ax=ax2)
-        ax2.set_title('Clusters with true labels, {}'.format(title))
+        ax2.set_title(title)
     else: # Only one plot for predicted labels
         fig = plt.figure(figsize=(6, 5))
         sns.scatterplot(x=x_emb[:, 0], y=x_emb[:, 1],
                         hue=y_pred, palette=sns.color_palette("hls", np.unique(y_pred).size),
                         legend="full")
-        plt.title('Clusters with pseudo labels, {}'.format(title))
+        plt.title(title)
 
     if fig_name != '':
         plt.savefig(fig_name, bbox_inches='tight')
 
     plt.close(fig)
+
+def knn_eval(test_embeddings, test_labels, knn_train_embeddings,
+             knn_train_labels, opt):
+    """KNN classification and plot in evaluations"""
+    # perform kNN classification
+    from sklearn.neighbors import KNeighborsClassifier
+    st = time.time()
+    neigh = KNeighborsClassifier(n_neighbors=50)
+    pred_labels = neigh.fit(knn_train_embeddings, knn_train_labels).predict(test_embeddings)
+    knn_time = time.time() - st
+    knn_acc = np.sum(pred_labels == test_labels) / pred_labels.size
+
+    print('ckpt: {} knn_acc: {}'.format(opt.ckpt, knn_acc))
+
+    # plot t-SNE for test embeddings
+    model_name = opt.ckpt.split('/')[-1].split('.')[0]
+    print(model_name)
+    plot_tsne(test_embeddings, pred_labels, test_labels,
+              title='knn acc: {}'.format(knn_acc),
+              fig_name='tsne_{}_{}.png'.format(opt.dataset, model_name))
+
+
 
 def parse_option():
     parser = argparse.ArgumentParser('argument for training')
@@ -168,88 +192,31 @@ def set_model(opt):
     return model, classifier, criterion
 
 
-def train(train_loader, model, classifier, criterion, optimizer, epoch, opt):
-    """one epoch training"""
-    model.eval()
-    classifier.train()
 
-    batch_time = AverageMeter()
-    data_time = AverageMeter()
-    losses = AverageMeter()
-    top1 = AverageMeter()
-
-    end = time.time()
-    for idx, (images, labels) in enumerate(train_loader):
-        data_time.update(time.time() - end)
-
-        images = images.cuda(non_blocking=True)
-        labels = labels.cuda(non_blocking=True)
-        bsz = labels.shape[0]
-
-        # warm-up learning rate
-        warmup_learning_rate(opt, epoch, idx, len(train_loader), optimizer)
-
-        # compute loss
-        with torch.no_grad():
-            features = model.encoder(images)
-        output = classifier(features.detach())
-        loss = criterion(output, labels)
-
-        # update metric
-        losses.update(loss.item(), bsz)
-        # print(output.shape, labels.shape)
-        acc1, acc5 = accuracy(output, labels, topk=(1, 5))
-        top1.update(acc1[0], bsz)
-
-        # SGD
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-
-        # measure elapsed time
-        batch_time.update(time.time() - end)
-        end = time.time()
-
-        # print info
-        if (idx + 1) % opt.print_freq == 0:
-            print('Train: [{0}][{1}/{2}]\t'
-                  'BT {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
-                  'DT {data_time.val:.3f} ({data_time.avg:.3f})\t'
-                  'loss {loss.val:.3f} ({loss.avg:.3f})\t'
-                  'Acc@1 {top1.val:.3f} ({top1.avg:.3f})'.format(
-                  epoch, idx + 1, len(train_loader), batch_time=batch_time,
-                  data_time=data_time, loss=losses, top1=top1))
-            sys.stdout.flush()
-
-    return losses.avg, top1.avg
-
-
-def validate(val_loader, model, classifier, criterion, opt, epoch):
+def validate(train_loader, val_loader, model, classifier, criterion, opt):
     """validation"""
     model.eval()
     classifier.eval()
-    test_labels, pred_labels = [], []
-    test_embeddings = None
-
-    batch_time = AverageMeter()
-    losses = AverageMeter()
-    top1 = AverageMeter()
+    test_labels, knn_labels = [], []
+    test_embeddings, knn_embeddings = None, None
 
     with torch.no_grad():
-        end = time.time()
+        for idx, (images, labels) in enumerate(train_loader):
+            if torch.cuda.is_available():
+                images = images.cuda(non_blocking=True)
+
+            embeddings = model.encoder(images).detach().cpu().numpy()
+            if knn_embeddings is None:
+                knn_embeddings = embeddings
+            else:
+                knn_embeddings = np.concatenate((knn_embeddings, embeddings), axis=0)
+            knn_labels += labels.detach().tolist()
+        knn_labels = np.array(knn_labels).astype(int)
+
         for idx, (images, labels) in enumerate(val_loader):
             images = images.float().cuda()
             labels = labels.cuda()
             bsz = labels.shape[0]
-
-            # forward
-            output = classifier(model.encoder(images))
-            loss = criterion(output, labels)
-
-            # update metric
-            losses.update(loss.item(), bsz)
-            acc1, acc5 = accuracy(output, labels, topk=(1, 5))
-            top1.update(acc1[0], bsz)
 
             # collect embeddings
             embeddings = model.encoder(images).detach().cpu().numpy()
@@ -258,27 +225,12 @@ def validate(val_loader, model, classifier, criterion, opt, epoch):
             else:
                 test_embeddings = np.concatenate((test_embeddings, embeddings), axis=0)
             test_labels += labels.detach().tolist()
-            pred_labels += output.detach().tolist()
 
-            # measure elapsed time
-            batch_time.update(time.time() - end)
-            end = time.time()
 
-            if idx % opt.print_freq == 0:
-                print('Test: [{0}/{1}]\t'
-                      'Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
-                      'Loss {loss.val:.4f} ({loss.avg:.4f})\t'
-                      'Acc@1 {top1.val:.3f} ({top1.avg:.3f})'.format(
-                       idx, len(val_loader), batch_time=batch_time,
-                       loss=losses, top1=top1))
+        test_labels = np.array(test_labels).astype(int)
 
-    if epoch >= opt.epochs:
-        plot_tsne(test_embeddings, pred_labels, test_labels,
-                  title='test loss: {} test acc: {}'.format(losses.avg, top1.avg),
-                  fig_name='tsne_{}.png'.format(opt.ckpt))
+        knn_eval(test_embeddings, test_labels, knn_embeddings, knn_labels, opt)
 
-    print(' * Acc@1 {top1.avg:.3f}'.format(top1=top1))
-    return losses.avg, top1.avg
 
 
 def main():
@@ -295,25 +247,26 @@ def main():
     optimizer = set_optimizer(opt, classifier)
 
     # training routine
-    for epoch in range(1, opt.epochs + 1):
-        adjust_learning_rate(opt, optimizer, epoch)
+    #for epoch in range(1, opt.epochs + 1):
+    #    adjust_learning_rate(opt, optimizer, epoch)
 
         # train for one epoch
-        time1 = time.time()
-        loss, acc = train(train_loader, model, classifier, criterion,
-                          optimizer, epoch, opt)
-        time2 = time.time()
-        print('Train epoch {}, total time {:.2f}, accuracy:{:.2f}'.format(
-            epoch, time2 - time1, acc))
+    #    time1 = time.time()
+    #    loss, acc = train(train_loader, model, classifier, criterion,
+    #                      optimizer, epoch, opt)
+    #    time2 = time.time()
+    #    print('Train epoch {}, total time {:.2f}, accuracy:{:.2f}'.format(
+    #        epoch, time2 - time1, acc))
 
-        # eval for one epoch
-        loss, val_acc = validate(val_loader, model, classifier, criterion, opt,
-                                 epoch)
-        if val_acc > best_acc:
-            best_acc = val_acc
+    #    # eval for one epoch
+    #    loss, val_acc = validate(val_loader, model, classifier, criterion, opt,
+    #                             epoch)
+    #    if val_acc > best_acc:
+    #        best_acc = val_acc
 
-    print('best accuracy: {:.2f}'.format(best_acc))
+    #print('best accuracy: {:.2f}'.format(best_acc))
 
+    validate(train_loader, val_loader, model, classifier, criterion, opt)
 
 if __name__ == '__main__':
     main()
